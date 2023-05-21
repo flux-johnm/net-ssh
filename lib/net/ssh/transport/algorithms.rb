@@ -41,11 +41,12 @@ module Net
                   diffie-hellman-group-exchange-sha256
                   diffie-hellman-group14-sha1],
 
-          encryption: %w[aes256-ctr aes192-ctr aes128-ctr],
+          encryption: %w[aes256-ctr aes192-ctr aes128-ctr aes256-gcm@openssh.com aes128-gcm@openssh.com],
 
           hmac: %w[hmac-sha2-512-etm@openssh.com hmac-sha2-256-etm@openssh.com
                    hmac-sha2-512 hmac-sha2-256
-                   hmac-sha1]
+                   hmac-sha1
+                   aes128-gcm@openssh.com aes256-gcm@openssh.com]
         }.freeze
 
         if Net::SSH::Authentication::ED25519Loader::LOADED
@@ -143,7 +144,7 @@ module Net
 
         # Instantiates a new Algorithms object, and prepares the hash of preferred
         # algorithms based on the options parameter and the ALGORITHMS constant.
-        def initialize(session, options={})
+        def initialize(session, options = {})
           @session = session
           @logger = session.logger
           @options = options
@@ -275,7 +276,7 @@ module Net
             # existing known key for the host has preference.
 
             existing_keys = session.host_keys
-            host_keys = existing_keys.map { |key| key.ssh_type }.uniq
+            host_keys = existing_keys.flat_map { |key| key.respond_to?(:ssh_types) ? key.ssh_types : [key.ssh_type] }.uniq
             algorithms[:host_key].each do |name|
               host_keys << name unless host_keys.include?(name)
             end
@@ -366,10 +367,10 @@ module Net
           language    = algorithms[:language].join(",")
 
           Net::SSH::Buffer.from(:byte, KEXINIT,
-            :long, [rand(0xFFFFFFFF), rand(0xFFFFFFFF), rand(0xFFFFFFFF), rand(0xFFFFFFFF)],
-            :mstring, [kex, host_key, encryption, encryption, hmac, hmac],
-            :mstring, [compression, compression, language, language],
-            :bool, false, :long, 0)
+                                :long, [rand(0xFFFFFFFF), rand(0xFFFFFFFF), rand(0xFFFFFFFF), rand(0xFFFFFFFF)],
+                                :mstring, [kex, host_key, encryption, encryption, hmac, hmac],
+                                :mstring, [compression, compression, language, language],
+                                :bool, false, :long, 0)
         end
 
         # Given the parsed server KEX packet, and the client's preferred algorithm
@@ -402,7 +403,6 @@ module Net
         # #negotiate_algorithms.
         def negotiate(algorithm)
           match = self[algorithm].find { |item| @server_data[algorithm].include?(item) }
-
           if match.nil?
             raise Net::SSH::Exception, "could not settle on #{algorithm} algorithm\n"\
               "Server #{algorithm} preferences: #{@server_data[algorithm].join(',')}\n"\
@@ -435,13 +435,13 @@ module Net
           debug { "exchanging keys" }
 
           algorithm = Kex::MAP[kex].new(self, session,
-            client_version_string: Net::SSH::Transport::ServerVersion::PROTO_VERSION,
-            server_version_string: session.server_version.version,
-            server_algorithm_packet: @server_packet,
-            client_algorithm_packet: @client_packet,
-            need_bytes: kex_byte_requirement,
-            minimum_dh_bits: options[:minimum_dh_bits],
-            logger: logger)
+                                        client_version_string: Net::SSH::Transport::ServerVersion::PROTO_VERSION,
+                                        server_version_string: session.server_version.version,
+                                        server_algorithm_packet: @server_packet,
+                                        client_algorithm_packet: @client_packet,
+                                        need_bytes: kex_byte_requirement,
+                                        minimum_dh_bits: options[:minimum_dh_bits],
+                                        logger: logger)
           result = algorithm.exchange_keys
 
           secret   = result[:shared_secret].to_ssh
@@ -464,8 +464,17 @@ module Net
           cipher_client = CipherFactory.get(encryption_client, parameters.merge(iv: iv_client, key: key_client, encrypt: true))
           cipher_server = CipherFactory.get(encryption_server, parameters.merge(iv: iv_server, key: key_server, decrypt: true))
 
-          mac_client = HMAC.get(hmac_client, mac_key_client, parameters)
-          mac_server = HMAC.get(hmac_server, mac_key_server, parameters)
+          # When aesXXX-gcm is used, mac algorithm is implicit, so we have to use a kind of placeholder.
+          aead_client, aead_server = nil
+
+          aead_client = 'aes128-gcm@openssh.com' if cipher_client.to_s == 'id-aes128-GCM'
+          aead_server = 'aes128-gcm@openssh.com' if cipher_server.to_s == 'id-aes128-GCM'
+
+          aead_client = 'aes256-gcm@openssh.com' if cipher_client.to_s == 'id-aes256-GCM'
+          aead_server = 'aes256-gcm@openssh.com' if cipher_server.to_s == 'id-aes256-GCM'
+
+          mac_client = HMAC.get(aead_client || hmac_client, mac_key_client, parameters)
+          mac_server = HMAC.get(aead_server || hmac_server, mac_key_server, parameters)
 
           session.configure_client cipher: cipher_client, hmac: mac_client,
                                    compression: normalize_compression_name(compression_client),
